@@ -58,6 +58,12 @@ class _TrackingScreenState extends State<TrackingScreen> {
   BitmapDescriptor? _passengerIcon;
   BitmapDescriptor? _busIcon;
 
+  BitmapDescriptor? _matchedBusIcon;
+
+  List<Map<String, dynamic>> _directionPickupCandidates = [];
+  Map<String, dynamic>? _selectedPickupStop;
+  String? _customPickupText;
+
   final String baseUrl = 'https://bustrack-backend-production.up.railway.app/api';
   final String googleApiKey = "AIzaSyAdHYOEiD2KR9po_zblfuywen25inzQECU";
 
@@ -120,6 +126,122 @@ class _TrackingScreenState extends State<TrackingScreen> {
       return '0${cleaned.substring(2)}';
     }
     return cleaned;
+  }
+
+  String _pickupRequestStatus() {
+    return (_activePickupRequest?['status'] ?? '').toString().toUpperCase();
+  }
+
+  bool get _isPickupPending => _pickupRequestStatus() == 'PENDING';
+  bool get _isPickupAccepted => _pickupRequestStatus() == 'ACCEPTED';
+
+  int? _extractMatchedTripId() {
+    if (_activePickupRequest == null) return null;
+
+    final value = _activePickupRequest!['assigned_trip_id'];
+    return int.tryParse(value?.toString() ?? '');
+  }
+
+  bool _isMatchedBus(Map<String, dynamic> bus) {
+    if (!_isPickupAccepted) return false;
+
+    final matchedTripId = _extractMatchedTripId();
+    final busTripId = int.tryParse(bus['trip_id']?.toString() ?? '');
+
+    if (matchedTripId != null && busTripId != null) {
+      return matchedTripId == busTripId;
+    }
+
+    return false;
+  }
+
+  Map<String, dynamic>? _getMatchedBus() {
+    for (final bus in _activeBuses) {
+      if (_isMatchedBus(bus)) {
+        return bus;
+      }
+    }
+    return null;
+  }
+
+  void _prepareDirectionAwarePickupCandidates() {
+    if (_activeBuses.isEmpty || _stops.isEmpty) {
+      return;
+    }
+
+    final Map<String, Map<String, dynamic>> uniqueCandidates = {};
+
+    for (final bus in _activeBuses) {
+      final stopId = bus['matched_from_stop_id'];
+      final stopName = bus['matched_from_stop_name'];
+      final sequence = bus['matched_from_sequence'];
+
+      if (stopId == null) continue;
+
+      final stopIdInt = int.tryParse(stopId.toString());
+      if (stopIdInt == null) continue;
+
+      Map<String, dynamic>? fullStop;
+
+      for (final stop in _stops) {
+        final currentStopId = int.tryParse(stop['stop_id']?.toString() ?? '');
+        if (currentStopId == stopIdInt) {
+          fullStop = Map<String, dynamic>.from(stop);
+          break;
+        }
+      }
+
+      fullStop ??= {
+        'stop_id': stopIdInt,
+        'stop_name': stopName,
+        'sequence': sequence,
+        'latitude': null,
+        'longitude': null,
+      };
+
+      uniqueCandidates[stopIdInt.toString()] = {
+        ...fullStop,
+        'matched_from_sequence': sequence,
+      };
+    }
+
+    final candidates = uniqueCandidates.values.toList();
+
+    if (_userLocation != null) {
+      candidates.sort((a, b) {
+        final aLat = _parseDouble(a['latitude']);
+        final aLng = _parseDouble(a['longitude']);
+        final bLat = _parseDouble(b['latitude']);
+        final bLng = _parseDouble(b['longitude']);
+
+        final aDistance = (aLat == 0.0 && aLng == 0.0)
+            ? double.infinity
+            : Geolocator.distanceBetween(
+          _userLocation!.latitude,
+          _userLocation!.longitude,
+          aLat,
+          aLng,
+        );
+
+        final bDistance = (bLat == 0.0 && bLng == 0.0)
+            ? double.infinity
+            : Geolocator.distanceBetween(
+          _userLocation!.latitude,
+          _userLocation!.longitude,
+          bLat,
+          bLng,
+        );
+
+        return aDistance.compareTo(bDistance);
+      });
+    }
+
+    _directionPickupCandidates = candidates;
+
+    if (_directionPickupCandidates.isNotEmpty) {
+      _selectedPickupStop ??= _directionPickupCandidates.first;
+      _nearestStop = _selectedPickupStop;
+    }
   }
 
   bool _isSamePassengerRequest(Map<String, dynamic> request) {
@@ -255,16 +377,28 @@ class _TrackingScreenState extends State<TrackingScreen> {
       return;
     }
 
+    _prepareDirectionAwarePickupCandidates();
+
     final nameController = TextEditingController(text: _savedPassenger?.name ?? '');
     final phoneController = TextEditingController(text: _savedPassenger?.phone ?? '');
     final passengerCountController = TextEditingController(text: '1');
     final notesController = TextEditingController(text: widget.toLocation ?? '');
+    final pickupTextController = TextEditingController(
+      text: _customPickupText ??
+          _selectedPickupStop?['stop_name']?.toString() ??
+          _nearestStop?['stop_name']?.toString() ??
+          widget.fromLocation ??
+          '',
+    );
 
     await showModalBottomSheet(
       context: context,
       isScrollControlled: true,
       backgroundColor: Colors.transparent,
       builder: (context) {
+        Map<String, dynamic>? localSelectedStop =
+            _selectedPickupStop ?? _nearestStop ?? (_directionPickupCandidates.isNotEmpty ? _directionPickupCandidates.first : null);
+
         return StatefulBuilder(
           builder: (context, setModalState) {
             return Padding(
@@ -329,12 +463,79 @@ class _TrackingScreenState extends State<TrackingScreen> {
                         widget.route['route_number']?.toString() ?? '-',
                       ),
                       const SizedBox(height: 10),
-                      _buildQuickInfoRow(
-                        'Pickup',
-                        _nearestStop?['stop_name']?.toString() ??
-                            widget.fromLocation ??
-                            'Current Location',
+
+                      const Text(
+                        'Pickup stop',
+                        style: TextStyle(fontWeight: FontWeight.w600),
                       ),
+                      const SizedBox(height: 8),
+
+                      if (_directionPickupCandidates.isNotEmpty)
+                        ..._directionPickupCandidates.take(3).map((stop) {
+                          final isSelected =
+                              localSelectedStop?['stop_id'].toString() == stop['stop_id'].toString();
+
+                          return Container(
+                            margin: const EdgeInsets.only(bottom: 8),
+                            child: InkWell(
+                              onTap: () {
+                                setModalState(() {
+                                  localSelectedStop = stop;
+                                  pickupTextController.text =
+                                      stop['stop_name']?.toString() ?? '';
+                                });
+                              },
+                              borderRadius: BorderRadius.circular(12),
+                              child: Container(
+                                padding: const EdgeInsets.all(12),
+                                decoration: BoxDecoration(
+                                  borderRadius: BorderRadius.circular(12),
+                                  border: Border.all(
+                                    color: isSelected ? Colors.blue : Colors.grey.shade300,
+                                    width: isSelected ? 2 : 1,
+                                  ),
+                                  color: isSelected ? Colors.blue.shade50 : Colors.white,
+                                ),
+                                child: Row(
+                                  children: [
+                                    Icon(
+                                      Icons.location_on,
+                                      color: isSelected ? Colors.blue : Colors.grey,
+                                    ),
+                                    const SizedBox(width: 10),
+                                    Expanded(
+                                      child: Text(
+                                        stop['stop_name']?.toString() ?? '-',
+                                        style: TextStyle(
+                                          fontWeight:
+                                          isSelected ? FontWeight.bold : FontWeight.w500,
+                                        ),
+                                      ),
+                                    ),
+                                  ],
+                                ),
+                              ),
+                            ),
+                          );
+                        })
+                      else
+                        _buildQuickInfoRow(
+                          'Pickup',
+                          _nearestStop?['stop_name']?.toString() ??
+                              widget.fromLocation ??
+                              'Current Location',
+                        ),
+
+                      const SizedBox(height: 12),
+                      TextField(
+                        controller: pickupTextController,
+                        decoration: const InputDecoration(
+                          labelText: 'Pickup landmark / text',
+                          prefixIcon: Icon(Icons.edit_location_alt),
+                          border: OutlineInputBorder(),
+                        ),
+                      ),
+
                       const SizedBox(height: 10),
                       _buildQuickInfoRow(
                         'Destination',
@@ -386,10 +587,8 @@ class _TrackingScreenState extends State<TrackingScreen> {
                           onPressed: _isSubmittingPickupRequest
                               ? null
                               : () async {
-                            final count = int.tryParse(
-                              passengerCountController.text.trim(),
-                            ) ??
-                                0;
+                            final count =
+                                int.tryParse(passengerCountController.text.trim()) ?? 0;
 
                             if (count <= 0) {
                               ScaffoldMessenger.of(context).showSnackBar(
@@ -400,6 +599,12 @@ class _TrackingScreenState extends State<TrackingScreen> {
                               );
                               return;
                             }
+
+                            setState(() {
+                              _selectedPickupStop = localSelectedStop;
+                              _nearestStop = localSelectedStop ?? _nearestStop;
+                              _customPickupText = pickupTextController.text.trim();
+                            });
 
                             Navigator.pop(context);
 
@@ -438,7 +643,6 @@ class _TrackingScreenState extends State<TrackingScreen> {
       },
     );
   }
-
   Widget _buildQuickInfoRow(String label, String value) {
     return Row(
       children: [
@@ -485,14 +689,18 @@ class _TrackingScreenState extends State<TrackingScreen> {
         _savedPassenger = Passenger(name: passengerName, phone: passengerPhone);
       }
 
+      final pickupStop = _selectedPickupStop ?? _nearestStop;
+
       final result = await _apiService.createPickupRequest(
         routeId: int.parse(widget.route['route_id'].toString()),
         passengerName: passengerName,
         passengerPhone: passengerPhone,
-        pickupStopId: _nearestStop?['stop_id'] is int
-            ? _nearestStop!['stop_id'] as int
-            : int.tryParse((_nearestStop?['stop_id'] ?? '').toString()),
-        pickupLocationText: _nearestStop?['stop_name']?.toString() ??
+        pickupStopId: pickupStop?['stop_id'] is int
+            ? pickupStop!['stop_id'] as int
+            : int.tryParse((pickupStop?['stop_id'] ?? '').toString()),
+        pickupLocationText: (_customPickupText != null && _customPickupText!.trim().isNotEmpty)
+            ? _customPickupText!.trim()
+            : pickupStop?['stop_name']?.toString() ??
             widget.fromLocation ??
             'Current Location',
         latitude: _userLocation!.latitude,
@@ -593,6 +801,10 @@ class _TrackingScreenState extends State<TrackingScreen> {
 
     final status = (_activePickupRequest!['status'] ?? 'PENDING').toString().toUpperCase();
 
+    if (status == 'CANCELLED' || status == 'COMPLETED') {
+      return const SizedBox.shrink();
+    }
+
     Color bgColor;
     Color borderColor;
     IconData icon;
@@ -603,7 +815,7 @@ class _TrackingScreenState extends State<TrackingScreen> {
         bgColor = Colors.green.shade50;
         borderColor = Colors.green.shade200;
         icon = Icons.check_circle;
-        title = 'Driver accepted your pickup request';
+        title = 'Matched Bus Found';
         break;
       case 'PENDING':
       default:
@@ -614,8 +826,9 @@ class _TrackingScreenState extends State<TrackingScreen> {
         break;
     }
 
-    final pickupText = (_activePickupRequest!['pickup_stop_name'] ??
-        _activePickupRequest!['pickup_location_text'] ??
+    final pickupText = (_activePickupRequest!['pickup_location_text'] ??
+        _activePickupRequest!['pickup_stop_name'] ??
+        _selectedPickupStop?['stop_name'] ??
         _nearestStop?['stop_name'] ??
         'Pickup location')
         .toString();
@@ -624,6 +837,7 @@ class _TrackingScreenState extends State<TrackingScreen> {
     (_activePickupRequest!['destination_text'] ?? widget.toLocation ?? '-').toString();
 
     final driverName = (_activePickupRequest!['assigned_driver_name'] ?? '').toString();
+    final matchedBus = _getMatchedBus();
 
     return Card(
       margin: EdgeInsets.zero,
@@ -659,14 +873,14 @@ class _TrackingScreenState extends State<TrackingScreen> {
             const SizedBox(height: 10),
             Text('Pickup: $pickupText'),
             Text('Destination: $destinationText'),
-            Text(
-              'Passengers: ${_activePickupRequest!['passenger_count'] ?? 1}',
-            ),
+            Text('Passengers: ${_activePickupRequest!['passenger_count'] ?? 1}'),
             if (driverName.isNotEmpty) Text('Driver: $driverName'),
+            if (matchedBus != null)
+              Text('Bus: ${matchedBus['bus_number'] ?? 'Matched Bus'}'),
             const SizedBox(height: 12),
             Row(
               children: [
-                if (status == 'PENDING' || status == 'ACCEPTED')
+                if (status == 'PENDING')
                   Expanded(
                     child: OutlinedButton.icon(
                       onPressed: _cancelMyPickupRequest,
@@ -675,6 +889,30 @@ class _TrackingScreenState extends State<TrackingScreen> {
                       style: OutlinedButton.styleFrom(
                         foregroundColor: Colors.red,
                         side: const BorderSide(color: Colors.red),
+                      ),
+                    ),
+                  ),
+                if (status == 'ACCEPTED')
+                  Expanded(
+                    child: ElevatedButton.icon(
+                      onPressed: () {
+                        final matched = _getMatchedBus();
+                        if (matched != null) {
+                          final matchedIndex = _activeBuses.indexOf(matched);
+                          if (matchedIndex != -1) {
+                            setState(() {
+                              _selectedBusIndex = matchedIndex;
+                            });
+                            _updateMapMarkers();
+                            _drawBusToPassengerLine();
+                          }
+                        }
+                      },
+                      icon: const Icon(Icons.directions_bus),
+                      label: const Text('Matched Bus'),
+                      style: ElevatedButton.styleFrom(
+                        backgroundColor: Colors.green[700],
+                        foregroundColor: Colors.white,
                       ),
                     ),
                   ),
@@ -697,7 +935,6 @@ class _TrackingScreenState extends State<TrackingScreen> {
       ),
     );
   }
-
   Future<List<LatLng>> _getRoadPolyline(LatLng origin, LatLng dest) async {
     final url = Uri.parse(
       "https://maps.googleapis.com/maps/api/directions/json"
@@ -781,6 +1018,8 @@ class _TrackingScreenState extends State<TrackingScreen> {
               (b) => b['trip_id'] == _myBooking!['trip_id'],
           orElse: () => _activeBuses.first,
         );
+      } else if (_isPickupAccepted && _getMatchedBus() != null) {
+        bus = _getMatchedBus()!;
       } else {
         bus = _activeBuses[_selectedBusIndex ?? 0];
       }
@@ -1058,6 +1297,12 @@ class _TrackingScreenState extends State<TrackingScreen> {
       iconColor: Colors.white,
     );
 
+    _matchedBusIcon = await _createCustomMarker(
+      icon: Icons.directions_bus,
+      backgroundColor: Colors.blue,
+      iconColor: Colors.white,
+    );
+
     print('✅ Custom marker icons created');
 
     if (mounted) {
@@ -1175,6 +1420,15 @@ class _TrackingScreenState extends State<TrackingScreen> {
   void _findNearestStop() {
     if (_userLocation == null || _stops.isEmpty) return;
 
+    _prepareDirectionAwarePickupCandidates();
+
+    if (_directionPickupCandidates.isNotEmpty) {
+      setState(() {
+        _nearestStop = _selectedPickupStop ?? _directionPickupCandidates.first;
+      });
+      return;
+    }
+
     double minDistance = double.infinity;
     Map<String, dynamic>? nearest;
 
@@ -1237,6 +1491,18 @@ class _TrackingScreenState extends State<TrackingScreen> {
             _activeBuses = buses;
             _isLoading = false;
           });
+
+          _prepareDirectionAwarePickupCandidates();
+
+          if (_isPickupAccepted) {
+            final matchedBus = _getMatchedBus();
+            if (matchedBus != null) {
+              final matchedIndex = _activeBuses.indexOf(matchedBus);
+              if (matchedIndex != -1) {
+                _selectedBusIndex = matchedIndex;
+              }
+            }
+          }
 
           _updateMapMarkers();
           _drawBusToPassengerLine();
@@ -1391,11 +1657,11 @@ class _TrackingScreenState extends State<TrackingScreen> {
 
     for (var i = 0; i < _activeBuses.length; i++) {
       try {
-        var bus = _activeBuses[i];
+        final bus = _activeBuses[i];
         print('\n🚌 Processing bus $i: ${bus['bus_number']}');
 
-        var latValue = bus['current_latitude'] ?? bus['latitude'];
-        var lngValue = bus['current_longitude'] ?? bus['longitude'];
+        final latValue = bus['current_latitude'] ?? bus['latitude'];
+        final lngValue = bus['current_longitude'] ?? bus['longitude'];
 
         print(
           '   Raw values - lat: $latValue (${latValue.runtimeType}), lng: $lngValue (${lngValue.runtimeType})',
@@ -1406,21 +1672,29 @@ class _TrackingScreenState extends State<TrackingScreen> {
           continue;
         }
 
-        double busLat = _parseDouble(latValue);
-        double busLng = _parseDouble(lngValue);
+        final double busLat = _parseDouble(latValue);
+        final double busLng = _parseDouble(lngValue);
 
         print('✅ Parsed coordinates: $busLat, $busLng');
+
+        final bool isMatched = _isMatchedBus(bus);
 
         final busMarker = Marker(
           markerId: MarkerId('bus_${i}_${bus['trip_id']}'),
           position: LatLng(busLat, busLng),
-          icon: _busIcon ?? BitmapDescriptor.defaultMarkerWithHue(BitmapDescriptor.hueOrange),
+          icon: isMatched
+              ? (_matchedBusIcon ??
+              BitmapDescriptor.defaultMarkerWithHue(BitmapDescriptor.hueBlue))
+              : (_busIcon ??
+              BitmapDescriptor.defaultMarkerWithHue(BitmapDescriptor.hueOrange)),
           infoWindow: InfoWindow(
-            title: '🚌 ${bus['bus_number'] ?? 'Bus'}',
+            title: isMatched
+                ? '✅ Matched Bus - ${bus['bus_number'] ?? 'Bus'}'
+                : '🚌 ${bus['bus_number'] ?? 'Bus'}',
             snippet: 'Driver: ${bus['driver_name'] ?? 'Unknown'}',
           ),
           anchor: const Offset(0.5, 0.5),
-          zIndex: 1.0,
+          zIndex: isMatched ? 3.0 : 1.0,
         );
 
         markers.add(busMarker);
@@ -1438,7 +1712,8 @@ class _TrackingScreenState extends State<TrackingScreen> {
         final userMarker = Marker(
           markerId: const MarkerId('user_location'),
           position: LatLng(_userLocation!.latitude, _userLocation!.longitude),
-          icon: _passengerIcon ?? BitmapDescriptor.defaultMarkerWithHue(BitmapDescriptor.hueGreen),
+          icon: _passengerIcon ??
+              BitmapDescriptor.defaultMarkerWithHue(BitmapDescriptor.hueGreen),
           infoWindow: const InfoWindow(title: '📍 You'),
           anchor: const Offset(0.5, 0.5),
           zIndex: 2.0,
@@ -1469,14 +1744,16 @@ class _TrackingScreenState extends State<TrackingScreen> {
                   (b) => b['trip_id'] == _myBooking!['trip_id'],
               orElse: () => _activeBuses.first,
             );
+          } else if (_isPickupAccepted && _getMatchedBus() != null) {
+            bus = _getMatchedBus()!;
           } else {
             bus = _activeBuses[_selectedBusIndex ?? 0];
           }
 
-          var busLat = _parseDouble(bus['current_latitude'] ?? bus['latitude']);
-          var busLng = _parseDouble(bus['current_longitude'] ?? bus['longitude']);
+          final busLat = _parseDouble(bus['current_latitude'] ?? bus['latitude']);
+          final busLng = _parseDouble(bus['current_longitude'] ?? bus['longitude']);
 
-          double distance = Geolocator.distanceBetween(
+          final double distance = Geolocator.distanceBetween(
             _userLocation!.latitude,
             _userLocation!.longitude,
             busLat,
@@ -1485,8 +1762,8 @@ class _TrackingScreenState extends State<TrackingScreen> {
 
           print('📏 Distance between user and bus: ${distance.toStringAsFixed(1)} meters');
 
-          double centerLat = (_userLocation!.latitude + busLat) / 2;
-          double centerLng = (_userLocation!.longitude + busLng) / 2;
+          final double centerLat = (_userLocation!.latitude + busLat) / 2;
+          final double centerLng = (_userLocation!.longitude + busLng) / 2;
 
           double zoom = 18;
           if (distance > 10) zoom = 17;
@@ -1519,7 +1796,6 @@ class _TrackingScreenState extends State<TrackingScreen> {
 
     print('🔍 === UPDATE MARKERS COMPLETE ===\n');
   }
-
   double _parseSpeed(dynamic speed) {
     if (speed == null) return 0.0;
     if (speed is double) return speed;
@@ -2050,6 +2326,7 @@ class _TrackingScreenState extends State<TrackingScreen> {
               final bus = _activeBuses[index - 1];
               final seatInfo = bus['seat_info'];
               final isSelected = _selectedBusIndex == (index - 1);
+              final isMatched = _isMatchedBus(bus);
 
               final distanceKm = _calculateDistanceToBus(bus);
               final speedKmh = _parseSpeed(bus['speed_kmh']);
@@ -2061,8 +2338,10 @@ class _TrackingScreenState extends State<TrackingScreen> {
                 shape: RoundedRectangleBorder(
                   borderRadius: BorderRadius.circular(12),
                   side: BorderSide(
-                    color: isSelected ? Colors.blue[800]! : Colors.transparent,
-                    width: 2,
+                    color: isMatched
+                        ? Colors.green
+                        : (isSelected ? Colors.blue[800]! : Colors.transparent),
+                    width: isMatched ? 3 : 2,
                   ),
                 ),
                 child: InkWell(
@@ -2081,12 +2360,12 @@ class _TrackingScreenState extends State<TrackingScreen> {
                               width: 50,
                               height: 50,
                               decoration: BoxDecoration(
-                                color: Colors.orange[100],
+                                color: isMatched ? Colors.green[100] : Colors.orange[100],
                                 borderRadius: BorderRadius.circular(10),
                               ),
                               child: Icon(
                                 Icons.directions_bus,
-                                color: Colors.orange[800],
+                                color: isMatched ? Colors.green[800] : Colors.orange[800],
                                 size: 28,
                               ),
                             ),
@@ -2109,6 +2388,18 @@ class _TrackingScreenState extends State<TrackingScreen> {
                                       color: Colors.grey[600],
                                     ),
                                   ),
+                                  if (isMatched)
+                                    const Padding(
+                                      padding: EdgeInsets.only(top: 4),
+                                      child: Text(
+                                        'Matched Bus',
+                                        style: TextStyle(
+                                          color: Colors.green,
+                                          fontWeight: FontWeight.bold,
+                                          fontSize: 12,
+                                        ),
+                                      ),
+                                    ),
                                 ],
                               ),
                             ),
@@ -2215,7 +2506,6 @@ class _TrackingScreenState extends State<TrackingScreen> {
       },
     );
   }
-
   Widget _buildInfoChip(IconData icon, String text, Color color) {
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
