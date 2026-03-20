@@ -5,10 +5,13 @@ import 'dart:async';
 import 'package:http/http.dart' as http;
 import 'dart:convert';
 import 'package:socket_io_client/socket_io_client.dart' as IO;
-import 'dart:math';
 import 'package:flutter_polyline_points/flutter_polyline_points.dart';
 import 'dart:ui' as ui;
+
 import 'booking_screen.dart';
+import '../services/api_service.dart';
+import '../services/login_service.dart';
+import '../models/passenger.dart';
 
 class TrackingScreen extends StatefulWidget {
   final Map<String, dynamic> route;
@@ -29,6 +32,8 @@ class TrackingScreen extends StatefulWidget {
 }
 
 class _TrackingScreenState extends State<TrackingScreen> {
+  final ApiService _apiService = ApiService();
+
   GoogleMapController? _mapController;
   Set<Marker> _markers = {};
   Set<Polyline> _polylines = {};
@@ -36,22 +41,26 @@ class _TrackingScreenState extends State<TrackingScreen> {
   List<Map<String, dynamic>> _stops = [];
   Timer? _locationTimer;
   Timer? _passengerLocationTimer;
+  Timer? _pickupRequestStatusTimer;
   IO.Socket? _socket;
   bool _isLoading = true;
   Position? _userLocation;
   Map<String, dynamic>? _nearestStop;
   int? _selectedBusIndex;
 
-  // ✅ NEW: Booking details
   Map<String, dynamic>? _myBooking;
   bool _isLoadingBooking = false;
+
+  Passenger? _savedPassenger;
+  Map<String, dynamic>? _activePickupRequest;
+  bool _isSubmittingPickupRequest = false;
 
   BitmapDescriptor? _passengerIcon;
   BitmapDescriptor? _busIcon;
 
   final String baseUrl = 'https://bustrack-backend-production.up.railway.app/api';
-
   final String googleApiKey = "AIzaSyAdHYOEiD2KR9po_zblfuywen25inzQECU";
+
   bool _isDrawingLine = false;
   DateTime? _lastPolylineTime;
 
@@ -61,6 +70,7 @@ class _TrackingScreenState extends State<TrackingScreen> {
     print('🚀 TrackingScreen initialized with bookingId: ${widget.bookingId}');
 
     _createMarkerIcons();
+    _loadSavedPassenger();
     _getUserLocation();
     _loadStops();
     _loadActiveBuses();
@@ -80,6 +90,614 @@ class _TrackingScreenState extends State<TrackingScreen> {
     }
   }
 
+  Future<void> _loadSavedPassenger() async {
+    try {
+      final passenger = await LoginService.getPassenger();
+      if (!mounted) return;
+
+      setState(() {
+        _savedPassenger = passenger;
+      });
+
+      if (widget.bookingId == null) {
+        await _recoverExistingPickupRequest();
+      }
+    } catch (e) {
+      print('❌ Error loading saved passenger: $e');
+    }
+  }
+
+  String _normalizePhone(String value) {
+    final raw = value.trim();
+    if (raw.isEmpty) return '';
+
+    final cleaned = raw.replaceAll(RegExp(r'[^0-9+]'), '');
+
+    if (cleaned.startsWith('+94')) {
+      return '0${cleaned.substring(3)}';
+    }
+    if (cleaned.startsWith('94') && cleaned.length >= 11) {
+      return '0${cleaned.substring(2)}';
+    }
+    return cleaned;
+  }
+
+  bool _isSamePassengerRequest(Map<String, dynamic> request) {
+    if (_savedPassenger == null) return false;
+
+    final savedPhone = _normalizePhone(_savedPassenger!.phone);
+    final requestPhone = _normalizePhone((request['passenger_phone'] ?? '').toString());
+
+    if (savedPhone.isNotEmpty && requestPhone.isNotEmpty) {
+      return savedPhone == requestPhone;
+    }
+
+    final savedName = _savedPassenger!.name.trim().toLowerCase();
+    final requestName = (request['passenger_name'] ?? '').toString().trim().toLowerCase();
+
+    return savedName.isNotEmpty && savedName == requestName;
+  }
+
+  bool _isOpenPickupStatus(String? status) {
+    final value = (status ?? '').toUpperCase();
+    return value == 'PENDING' || value == 'ACCEPTED';
+  }
+
+  Future<void> _recoverExistingPickupRequest() async {
+    if (_savedPassenger == null) return;
+    if (widget.bookingId != null) return;
+
+    try {
+      final requests = await _apiService.getPickupRequests(
+        routeId: int.parse(widget.route['route_id'].toString()),
+      );
+
+      final matches = requests
+          .where((r) => r is Map<String, dynamic>)
+          .cast<Map<String, dynamic>>()
+          .where((r) => _isSamePassengerRequest(r))
+          .where((r) => _isOpenPickupStatus(r['status']?.toString()))
+          .toList();
+
+      if (matches.isEmpty) return;
+
+      matches.sort((a, b) {
+        final aTime = DateTime.tryParse((a['requested_at'] ?? '').toString()) ?? DateTime(2000);
+        final bTime = DateTime.tryParse((b['requested_at'] ?? '').toString()) ?? DateTime(2000);
+        return bTime.compareTo(aTime);
+      });
+
+      if (!mounted) return;
+
+      setState(() {
+        _activePickupRequest = matches.first;
+      });
+
+      _startPickupRequestStatusPolling();
+    } catch (e) {
+      print('❌ Error recovering pickup request: $e');
+    }
+  }
+
+  void _startPickupRequestStatusPolling() {
+    _pickupRequestStatusTimer?.cancel();
+
+    if (_activePickupRequest == null) return;
+    if (!_isOpenPickupStatus(_activePickupRequest!['status']?.toString())) return;
+
+    _pickupRequestStatusTimer = Timer.periodic(const Duration(seconds: 12), (timer) async {
+      await _refreshPickupRequestStatus();
+    });
+  }
+
+  Future<void> _refreshPickupRequestStatus() async {
+    if (_activePickupRequest == null) return;
+
+    final requestId = int.tryParse(_activePickupRequest!['request_id'].toString());
+    if (requestId == null) return;
+
+    try {
+      final latest = await _apiService.getPickupRequestById(requestId);
+      if (!mounted || latest == null) return;
+
+      final oldStatus = (_activePickupRequest!['status'] ?? '').toString().toUpperCase();
+      final newStatus = (latest['status'] ?? '').toString().toUpperCase();
+
+      setState(() {
+        _activePickupRequest = latest;
+      });
+
+      if (oldStatus != newStatus) {
+        if (newStatus == 'ACCEPTED') {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(
+              content: Text('✅ A driver accepted your pickup request'),
+              backgroundColor: Colors.green,
+            ),
+          );
+        } else if (newStatus == 'CANCELLED') {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(
+              content: Text('Pickup request was cancelled'),
+              backgroundColor: Colors.orange,
+            ),
+          );
+          _pickupRequestStatusTimer?.cancel();
+          setState(() => _activePickupRequest = null);
+        } else if (newStatus == 'COMPLETED') {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(
+              content: Text('Pickup request completed'),
+              backgroundColor: Colors.green,
+            ),
+          );
+          _pickupRequestStatusTimer?.cancel();
+          setState(() => _activePickupRequest = null);
+        }
+      }
+
+      if (!_isOpenPickupStatus(newStatus)) {
+        _pickupRequestStatusTimer?.cancel();
+      }
+    } catch (e) {
+      print('❌ Error refreshing pickup request status: $e');
+    }
+  }
+
+  Future<void> _showQuickPickupRequestSheet() async {
+    if (_userLocation == null) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Current location not available yet'),
+          backgroundColor: Colors.red,
+        ),
+      );
+      return;
+    }
+
+    final nameController = TextEditingController(text: _savedPassenger?.name ?? '');
+    final phoneController = TextEditingController(text: _savedPassenger?.phone ?? '');
+    final passengerCountController = TextEditingController(text: '1');
+    final notesController = TextEditingController(text: widget.toLocation ?? '');
+
+    await showModalBottomSheet(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: Colors.transparent,
+      builder: (context) {
+        return StatefulBuilder(
+          builder: (context, setModalState) {
+            return Padding(
+              padding: EdgeInsets.only(
+                left: 16,
+                right: 16,
+                top: 16,
+                bottom: MediaQuery.of(context).viewInsets.bottom + 16,
+              ),
+              child: Container(
+                padding: const EdgeInsets.all(16),
+                decoration: BoxDecoration(
+                  color: Colors.white,
+                  borderRadius: BorderRadius.circular(20),
+                ),
+                child: SingleChildScrollView(
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Center(
+                        child: Container(
+                          width: 42,
+                          height: 4,
+                          decoration: BoxDecoration(
+                            color: Colors.grey[300],
+                            borderRadius: BorderRadius.circular(2),
+                          ),
+                        ),
+                      ),
+                      const SizedBox(height: 16),
+                      Row(
+                        children: [
+                          Container(
+                            padding: const EdgeInsets.all(10),
+                            decoration: BoxDecoration(
+                              color: Colors.orange[100],
+                              shape: BoxShape.circle,
+                            ),
+                            child: Icon(Icons.flash_on, color: Colors.orange[800]),
+                          ),
+                          const SizedBox(width: 12),
+                          const Expanded(
+                            child: Text(
+                              'Quick Match',
+                              style: TextStyle(
+                                fontSize: 20,
+                                fontWeight: FontWeight.bold,
+                              ),
+                            ),
+                          ),
+                        ],
+                      ),
+                      const SizedBox(height: 8),
+                      Text(
+                        'Send a quick pickup request for this route. A driver on this route can accept it.',
+                        style: TextStyle(color: Colors.grey[700]),
+                      ),
+                      const SizedBox(height: 16),
+                      _buildQuickInfoRow(
+                        'Route',
+                        widget.route['route_number']?.toString() ?? '-',
+                      ),
+                      const SizedBox(height: 10),
+                      _buildQuickInfoRow(
+                        'Pickup',
+                        _nearestStop?['stop_name']?.toString() ??
+                            widget.fromLocation ??
+                            'Current Location',
+                      ),
+                      const SizedBox(height: 10),
+                      _buildQuickInfoRow(
+                        'Destination',
+                        widget.toLocation?.toString() ?? '-',
+                      ),
+                      const SizedBox(height: 16),
+                      TextField(
+                        controller: nameController,
+                        decoration: const InputDecoration(
+                          labelText: 'Name',
+                          prefixIcon: Icon(Icons.person),
+                          border: OutlineInputBorder(),
+                        ),
+                      ),
+                      const SizedBox(height: 12),
+                      TextField(
+                        controller: phoneController,
+                        keyboardType: TextInputType.phone,
+                        decoration: const InputDecoration(
+                          labelText: 'Phone',
+                          prefixIcon: Icon(Icons.phone),
+                          border: OutlineInputBorder(),
+                        ),
+                      ),
+                      const SizedBox(height: 12),
+                      TextField(
+                        controller: passengerCountController,
+                        keyboardType: TextInputType.number,
+                        decoration: const InputDecoration(
+                          labelText: 'Passenger Count',
+                          prefixIcon: Icon(Icons.people),
+                          border: OutlineInputBorder(),
+                        ),
+                      ),
+                      const SizedBox(height: 12),
+                      TextField(
+                        controller: notesController,
+                        maxLines: 2,
+                        decoration: const InputDecoration(
+                          labelText: 'Note / destination (optional)',
+                          prefixIcon: Icon(Icons.notes),
+                          border: OutlineInputBorder(),
+                        ),
+                      ),
+                      const SizedBox(height: 18),
+                      SizedBox(
+                        width: double.infinity,
+                        child: ElevatedButton.icon(
+                          onPressed: _isSubmittingPickupRequest
+                              ? null
+                              : () async {
+                            final count = int.tryParse(
+                              passengerCountController.text.trim(),
+                            ) ??
+                                0;
+
+                            if (count <= 0) {
+                              ScaffoldMessenger.of(context).showSnackBar(
+                                const SnackBar(
+                                  content: Text('Enter a valid passenger count'),
+                                  backgroundColor: Colors.red,
+                                ),
+                              );
+                              return;
+                            }
+
+                            Navigator.pop(context);
+
+                            await _submitQuickPickupRequest(
+                              passengerName: nameController.text.trim(),
+                              passengerPhone: phoneController.text.trim(),
+                              passengerCount: count,
+                              notes: notesController.text.trim(),
+                            );
+                          },
+                          icon: _isSubmittingPickupRequest
+                              ? const SizedBox(
+                            width: 18,
+                            height: 18,
+                            child: CircularProgressIndicator(
+                              color: Colors.white,
+                              strokeWidth: 2,
+                            ),
+                          )
+                              : const Icon(Icons.send),
+                          label: const Text('Send Pickup Request'),
+                          style: ElevatedButton.styleFrom(
+                            backgroundColor: Colors.orange[700],
+                            foregroundColor: Colors.white,
+                            padding: const EdgeInsets.symmetric(vertical: 14),
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            );
+          },
+        );
+      },
+    );
+  }
+
+  Widget _buildQuickInfoRow(String label, String value) {
+    return Row(
+      children: [
+        SizedBox(
+          width: 95,
+          child: Text(
+            label,
+            style: const TextStyle(fontWeight: FontWeight.w600),
+          ),
+        ),
+        Expanded(
+          child: Text(
+            value,
+            style: TextStyle(color: Colors.grey[800]),
+          ),
+        ),
+      ],
+    );
+  }
+
+  Future<void> _submitQuickPickupRequest({
+    required String passengerName,
+    required String passengerPhone,
+    required int passengerCount,
+    required String notes,
+  }) async {
+    if (_userLocation == null) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Location not available'),
+          backgroundColor: Colors.red,
+        ),
+      );
+      return;
+    }
+
+    setState(() => _isSubmittingPickupRequest = true);
+
+    try {
+      if (passengerName.isNotEmpty && passengerPhone.isNotEmpty) {
+        await LoginService.savePassenger(
+          Passenger(name: passengerName, phone: passengerPhone),
+        );
+        _savedPassenger = Passenger(name: passengerName, phone: passengerPhone);
+      }
+
+      final result = await _apiService.createPickupRequest(
+        routeId: int.parse(widget.route['route_id'].toString()),
+        passengerName: passengerName,
+        passengerPhone: passengerPhone,
+        pickupStopId: _nearestStop?['stop_id'] is int
+            ? _nearestStop!['stop_id'] as int
+            : int.tryParse((_nearestStop?['stop_id'] ?? '').toString()),
+        pickupLocationText: _nearestStop?['stop_name']?.toString() ??
+            widget.fromLocation ??
+            'Current Location',
+        latitude: _userLocation!.latitude,
+        longitude: _userLocation!.longitude,
+        destinationText: widget.toLocation,
+        passengerCount: passengerCount,
+        notes: notes.isEmpty ? null : notes,
+      );
+
+      if (!mounted) return;
+
+      setState(() {
+        _activePickupRequest = result;
+      });
+
+      _startPickupRequestStatusPolling();
+
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('✅ Pickup request sent successfully'),
+          backgroundColor: Colors.green,
+        ),
+      );
+    } catch (e) {
+      print('❌ Quick pickup request error: $e');
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('Failed to send request: $e'),
+          backgroundColor: Colors.red,
+        ),
+      );
+    } finally {
+      if (mounted) {
+        setState(() => _isSubmittingPickupRequest = false);
+      }
+    }
+  }
+
+  Future<void> _cancelMyPickupRequest() async {
+    if (_activePickupRequest == null) return;
+
+    final requestId = int.tryParse(_activePickupRequest!['request_id'].toString());
+    if (requestId == null) return;
+
+    final confirm = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Cancel pickup request?'),
+        content: const Text('Do you want to cancel this pickup request?'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context, false),
+            child: const Text('No'),
+          ),
+          TextButton(
+            onPressed: () => Navigator.pop(context, true),
+            child: const Text('Yes'),
+          ),
+        ],
+      ),
+    );
+
+    if (confirm != true) return;
+
+    try {
+      final success = await _apiService.cancelPickupRequest(requestId);
+
+      if (!mounted) return;
+
+      if (success) {
+        _pickupRequestStatusTimer?.cancel();
+        setState(() {
+          _activePickupRequest = null;
+        });
+
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('Pickup request cancelled'),
+            backgroundColor: Colors.green,
+          ),
+        );
+      } else {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('Failed to cancel pickup request'),
+            backgroundColor: Colors.red,
+          ),
+        );
+      }
+    } catch (e) {
+      print('❌ Cancel pickup request error: $e');
+    }
+  }
+
+  Widget _buildPickupRequestStatusCard() {
+    if (_activePickupRequest == null) return const SizedBox.shrink();
+
+    final status = (_activePickupRequest!['status'] ?? 'PENDING').toString().toUpperCase();
+
+    Color bgColor;
+    Color borderColor;
+    IconData icon;
+    String title;
+
+    switch (status) {
+      case 'ACCEPTED':
+        bgColor = Colors.green.shade50;
+        borderColor = Colors.green.shade200;
+        icon = Icons.check_circle;
+        title = 'Driver accepted your pickup request';
+        break;
+      case 'PENDING':
+      default:
+        bgColor = Colors.orange.shade50;
+        borderColor = Colors.orange.shade200;
+        icon = Icons.schedule;
+        title = 'Pickup request sent';
+        break;
+    }
+
+    final pickupText = (_activePickupRequest!['pickup_stop_name'] ??
+        _activePickupRequest!['pickup_location_text'] ??
+        _nearestStop?['stop_name'] ??
+        'Pickup location')
+        .toString();
+
+    final destinationText =
+    (_activePickupRequest!['destination_text'] ?? widget.toLocation ?? '-').toString();
+
+    final driverName = (_activePickupRequest!['assigned_driver_name'] ?? '').toString();
+
+    return Card(
+      margin: EdgeInsets.zero,
+      elevation: 4,
+      shape: RoundedRectangleBorder(
+        borderRadius: BorderRadius.circular(14),
+        side: BorderSide(color: borderColor),
+      ),
+      child: Container(
+        decoration: BoxDecoration(
+          color: bgColor,
+          borderRadius: BorderRadius.circular(14),
+        ),
+        padding: const EdgeInsets.all(14),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                Icon(icon, color: status == 'ACCEPTED' ? Colors.green : Colors.orange),
+                const SizedBox(width: 10),
+                Expanded(
+                  child: Text(
+                    title,
+                    style: const TextStyle(
+                      fontWeight: FontWeight.bold,
+                      fontSize: 15,
+                    ),
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 10),
+            Text('Pickup: $pickupText'),
+            Text('Destination: $destinationText'),
+            Text(
+              'Passengers: ${_activePickupRequest!['passenger_count'] ?? 1}',
+            ),
+            if (driverName.isNotEmpty) Text('Driver: $driverName'),
+            const SizedBox(height: 12),
+            Row(
+              children: [
+                if (status == 'PENDING' || status == 'ACCEPTED')
+                  Expanded(
+                    child: OutlinedButton.icon(
+                      onPressed: _cancelMyPickupRequest,
+                      icon: const Icon(Icons.cancel),
+                      label: const Text('Cancel Request'),
+                      style: OutlinedButton.styleFrom(
+                        foregroundColor: Colors.red,
+                        side: const BorderSide(color: Colors.red),
+                      ),
+                    ),
+                  ),
+                const SizedBox(width: 10),
+                Expanded(
+                  child: ElevatedButton.icon(
+                    onPressed: _refreshPickupRequestStatus,
+                    icon: const Icon(Icons.refresh),
+                    label: const Text('Refresh'),
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: Colors.blue[800],
+                      foregroundColor: Colors.white,
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
   Future<List<LatLng>> _getRoadPolyline(LatLng origin, LatLng dest) async {
     final url = Uri.parse(
       "https://maps.googleapis.com/maps/api/directions/json"
@@ -92,7 +710,6 @@ class _TrackingScreenState extends State<TrackingScreen> {
     try {
       final res = await http.get(url).timeout(const Duration(seconds: 12));
 
-      // ✅ If HTTP failed
       if (res.statusCode != 200) {
         print("❌ Directions HTTP error: ${res.statusCode}");
         print("❌ Body: ${res.body}");
@@ -100,8 +717,6 @@ class _TrackingScreenState extends State<TrackingScreen> {
       }
 
       final data = json.decode(res.body);
-
-      // ✅ Print Google response status (VERY IMPORTANT)
       final status = data["status"];
       final errorMessage = data["error_message"];
       print("🧭 Directions status: $status");
@@ -109,7 +724,6 @@ class _TrackingScreenState extends State<TrackingScreen> {
         print("🧭 Directions error_message: $errorMessage");
       }
 
-      // ✅ Not OK = no polyline
       if (status != "OK") {
         return [];
       }
@@ -127,7 +741,6 @@ class _TrackingScreenState extends State<TrackingScreen> {
       }
 
       final encoded = overview["points"] as String;
-
       final decoded = PolylinePoints().decodePolyline(encoded);
 
       if (decoded.isEmpty) {
@@ -144,12 +757,12 @@ class _TrackingScreenState extends State<TrackingScreen> {
       return [];
     }
   }
+
   Future<void> _drawBusToPassengerLine() async {
     if (_isDrawingLine) return;
     if (_userLocation == null) return;
     if (_activeBuses.isEmpty) return;
 
-    // 🔒 Prevent too frequent Google API calls (every 8 seconds max)
     final now = DateTime.now();
     if (_lastPolylineTime != null &&
         now.difference(_lastPolylineTime!).inSeconds < 8) {
@@ -163,23 +776,18 @@ class _TrackingScreenState extends State<TrackingScreen> {
     try {
       Map<String, dynamic> bus;
 
-      // ✅ If passenger has booking → use that bus
       if (widget.bookingId != null && _myBooking != null) {
         bus = _activeBuses.firstWhere(
               (b) => b['trip_id'] == _myBooking!['trip_id'],
           orElse: () => _activeBuses.first,
         );
       } else {
-        // ✅ Otherwise use selected bus OR first bus
         bus = _activeBuses[_selectedBusIndex ?? 0];
       }
 
-      final busLat =
-      _parseDouble(bus['current_latitude'] ?? bus['latitude']);
-      final busLng =
-      _parseDouble(bus['current_longitude'] ?? bus['longitude']);
+      final busLat = _parseDouble(bus['current_latitude'] ?? bus['latitude']);
+      final busLng = _parseDouble(bus['current_longitude'] ?? bus['longitude']);
 
-      // 🛑 Safety check
       if (busLat == 0.0 || busLng == 0.0) {
         print("❌ Invalid bus coordinates");
         return;
@@ -191,14 +799,11 @@ class _TrackingScreenState extends State<TrackingScreen> {
         _userLocation!.longitude,
       );
 
-      // 🚗 Try getting real road polyline
       final roadPoints = await _getRoadPolyline(busPos, passengerPos);
-
-      // 🔁 Fallback: straight line if Google fails
-      final polylinePoints =
-      roadPoints.isNotEmpty ? roadPoints : [busPos, passengerPos];
+      final polylinePoints = roadPoints.isNotEmpty ? roadPoints : [busPos, passengerPos];
 
       if (!mounted) return;
+
       print("✅ Polyline points count: ${polylinePoints.length}");
       setState(() {
         _polylines = {
@@ -219,6 +824,7 @@ class _TrackingScreenState extends State<TrackingScreen> {
       _isDrawingLine = false;
     }
   }
+
   Future<void> _loadMyBooking() async {
     if (widget.bookingId == null) return;
 
@@ -479,6 +1085,7 @@ class _TrackingScreenState extends State<TrackingScreen> {
       ..color = Colors.white
       ..style = PaintingStyle.stroke
       ..strokeWidth = 8;
+
     canvas.drawCircle(
       Offset(size / 2, size / 2),
       size / 2,
@@ -621,7 +1228,8 @@ class _TrackingScreenState extends State<TrackingScreen> {
 
           for (var bus in buses) {
             print(
-                '📦 Bus data: ${bus['bus_number']} - lat: ${bus['latitude']}, lng: ${bus['longitude']}');
+              '📦 Bus data: ${bus['bus_number']} - lat: ${bus['latitude']}, lng: ${bus['longitude']}',
+            );
             await _loadBusSeatInfo(bus);
           }
 
@@ -649,6 +1257,7 @@ class _TrackingScreenState extends State<TrackingScreen> {
       setState(() => _isLoading = false);
     }
   }
+
   Future<void> _loadBusSeatInfo(Map<String, dynamic> bus) async {
     try {
       final url = Uri.parse('$baseUrl/trips/${bus['trip_id']}/seats');
@@ -740,7 +1349,7 @@ class _TrackingScreenState extends State<TrackingScreen> {
 
     setState(() {
       final busIndex = _activeBuses.indexWhere(
-              (bus) => bus['trip_id'] == data['trip_id'] || bus['bus_id'] == data['bus_id']
+            (bus) => bus['trip_id'] == data['trip_id'] || bus['bus_id'] == data['bus_id'],
       );
 
       if (busIndex != -1) {
@@ -766,6 +1375,10 @@ class _TrackingScreenState extends State<TrackingScreen> {
       print('⏰ Periodic update triggered');
       _loadActiveBuses();
       _getUserLocation();
+
+      if (_activePickupRequest != null) {
+        _refreshPickupRequestStatus();
+      }
     });
   }
 
@@ -784,14 +1397,15 @@ class _TrackingScreenState extends State<TrackingScreen> {
         var latValue = bus['current_latitude'] ?? bus['latitude'];
         var lngValue = bus['current_longitude'] ?? bus['longitude'];
 
-        print('   Raw values - lat: $latValue (${latValue.runtimeType}), lng: $lngValue (${lngValue.runtimeType})');
+        print(
+          '   Raw values - lat: $latValue (${latValue.runtimeType}), lng: $lngValue (${lngValue.runtimeType})',
+        );
 
         if (latValue == null || lngValue == null) {
           print('❌ Bus has null coordinates');
           continue;
         }
 
-        // ✅ FIXED: Use _parseDouble instead of double.parse
         double busLat = _parseDouble(latValue);
         double busLng = _parseDouble(lngValue);
 
@@ -811,7 +1425,6 @@ class _TrackingScreenState extends State<TrackingScreen> {
 
         markers.add(busMarker);
         print('✅ Bus marker added successfully!');
-
       } catch (e, stackTrace) {
         print('❌ ERROR adding bus marker: $e');
         print('Stack trace: $stackTrace');
@@ -833,7 +1446,6 @@ class _TrackingScreenState extends State<TrackingScreen> {
 
         markers.add(userMarker);
         print('✅ User marker added successfully!');
-
       } catch (e, stackTrace) {
         print('❌ ERROR adding user marker: $e');
         print('Stack trace: $stackTrace');
@@ -860,7 +1472,7 @@ class _TrackingScreenState extends State<TrackingScreen> {
           } else {
             bus = _activeBuses[_selectedBusIndex ?? 0];
           }
-          // ✅ FIXED: Use _parseDouble
+
           var busLat = _parseDouble(bus['current_latitude'] ?? bus['latitude']);
           var busLng = _parseDouble(bus['current_longitude'] ?? bus['longitude']);
 
@@ -908,7 +1520,6 @@ class _TrackingScreenState extends State<TrackingScreen> {
     print('🔍 === UPDATE MARKERS COMPLETE ===\n');
   }
 
-  // ✅ FIXED: Safe parsing helper functions
   double _parseSpeed(dynamic speed) {
     if (speed == null) return 0.0;
     if (speed is double) return speed;
@@ -917,7 +1528,6 @@ class _TrackingScreenState extends State<TrackingScreen> {
     return 0.0;
   }
 
-  // ✅ NEW: Generic double parser
   double _parseDouble(dynamic value) {
     if (value == null) return 0.0;
     if (value is double) return value;
@@ -926,7 +1536,6 @@ class _TrackingScreenState extends State<TrackingScreen> {
     return 0.0;
   }
 
-  // ✅ FIXED: Use _parseDouble for safe conversion
   double _calculateDistanceToBus(Map<String, dynamic> bus) {
     if (_userLocation == null) return 0.0;
 
@@ -935,7 +1544,6 @@ class _TrackingScreenState extends State<TrackingScreen> {
 
     if (latValue == null || lngValue == null) return 0.0;
 
-    // ✅ FIXED: Use _parseDouble instead of double.parse
     double busLat = _parseDouble(latValue);
     double busLng = _parseDouble(lngValue);
 
@@ -961,6 +1569,8 @@ class _TrackingScreenState extends State<TrackingScreen> {
 
   @override
   Widget build(BuildContext context) {
+    final topOffset = _nearestStop != null ? 102.0 : 16.0;
+
     return Scaffold(
       appBar: AppBar(
         title: Text(
@@ -976,6 +1586,7 @@ class _TrackingScreenState extends State<TrackingScreen> {
               print('🔄 Manual refresh triggered');
               _loadActiveBuses();
               _getUserLocation();
+              _refreshPickupRequestStatus();
               if (widget.bookingId != null) {
                 _loadMyBooking();
               }
@@ -983,6 +1594,26 @@ class _TrackingScreenState extends State<TrackingScreen> {
           ),
         ],
       ),
+      floatingActionButton: widget.bookingId == null &&
+          _activeBuses.isNotEmpty &&
+          _activePickupRequest == null
+          ? FloatingActionButton.extended(
+        onPressed: _showQuickPickupRequestSheet,
+        backgroundColor: Colors.orange[700],
+        foregroundColor: Colors.white,
+        icon: _isSubmittingPickupRequest
+            ? const SizedBox(
+          width: 18,
+          height: 18,
+          child: CircularProgressIndicator(
+            color: Colors.white,
+            strokeWidth: 2,
+          ),
+        )
+            : const Icon(Icons.flash_on),
+        label: const Text('Quick Match'),
+      )
+          : null,
       body: Stack(
         children: [
           GoogleMap(
@@ -1052,6 +1683,14 @@ class _TrackingScreenState extends State<TrackingScreen> {
                   ),
                 ),
               ),
+            ),
+
+          if (widget.bookingId == null && _activePickupRequest != null)
+            Positioned(
+              top: topOffset,
+              left: 16,
+              right: 16,
+              child: _buildPickupRequestStatusCard(),
             ),
 
           if (widget.bookingId != null && _myBooking != null)
@@ -1394,6 +2033,15 @@ class _TrackingScreenState extends State<TrackingScreen> {
                         fontWeight: FontWeight.bold,
                       ),
                     ),
+                    const SizedBox(height: 8),
+                    if (_activePickupRequest == null)
+                      Text(
+                        'Book a seat or use Quick Match',
+                        style: TextStyle(
+                          color: Colors.grey[600],
+                          fontSize: 13,
+                        ),
+                      ),
                     const SizedBox(height: 16),
                   ],
                 );
@@ -1541,7 +2189,8 @@ class _TrackingScreenState extends State<TrackingScreen> {
                                 : null,
                             icon: const Icon(Icons.book_online),
                             label: Text(
-                              seatInfo != null && _parseDouble(seatInfo['available_seats']) > 0
+                              seatInfo != null &&
+                                  _parseDouble(seatInfo['available_seats']) > 0
                                   ? 'Book Now'
                                   : 'Full - No Seats',
                             ),
@@ -1596,6 +2245,7 @@ class _TrackingScreenState extends State<TrackingScreen> {
   void dispose() {
     _locationTimer?.cancel();
     _passengerLocationTimer?.cancel();
+    _pickupRequestStatusTimer?.cancel();
     _socket?.disconnect();
     _socket?.dispose();
     _mapController?.dispose();

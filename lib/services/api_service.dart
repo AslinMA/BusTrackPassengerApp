@@ -3,20 +3,8 @@ import 'dart:async';
 import 'package:http/http.dart' as http;
 
 class ApiService {
-  // IMPORTANT: Replace this with your backend URL
-  // For local testing: use your computer's IP address
-  // For deployed backend: use your Railway/Render URL
   static const String baseUrl = 'https://bustrack-backend-production.up.railway.app/api';
 
-
-
-  // If testing on physical phone, use your computer's local IP:
-  // static const String baseUrl = 'http://192.168.1.X:3000/api';
-
-  // If backend is deployed:
-  // static const String baseUrl = 'https://your-app.railway.app/api';
-
-  // ========== ROUTE METHODS ==========
   Future<Map<String, dynamic>?> createOrUpdatePassenger({
     required String phone,
     required String name,
@@ -51,7 +39,6 @@ class ApiService {
     }
   }
 
-  /// Search for bus routes between two locations
   Future<List<dynamic>> searchRoutes(String from, String to) async {
     try {
       final response = await http.get(
@@ -70,7 +57,6 @@ class ApiService {
     }
   }
 
-  /// Get all bus routes
   Future<List<dynamic>> getAllRoutes() async {
     try {
       final response = await http.get(
@@ -89,7 +75,6 @@ class ApiService {
     }
   }
 
-  /// Get stops for a specific route
   Future<List<dynamic>> getRouteStops(int routeId) async {
     try {
       final response = await http.get(
@@ -112,16 +97,13 @@ class ApiService {
     }
   }
 
-  // ========== TRIP/BUS METHODS ==========
-
-  /// Get active trips (buses) on a specific route with live tracking
   Future<List<dynamic>> getBusesOnRoute(int routeId) async {
     try {
       final url = Uri.parse('$baseUrl/trips/active?route_id=$routeId');
 
       print('📞 Fetching active trips for route: $routeId');
 
-      final response = await http.get(url).timeout(Duration(seconds: 10));
+      final response = await http.get(url).timeout(const Duration(seconds: 10));
 
       print('📡 Response: ${response.statusCode}');
       print('📦 Data: ${response.body}');
@@ -135,14 +117,13 @@ class ApiService {
         }
       }
 
-      return []; // Return empty list instead of throwing
+      return [];
     } catch (e) {
       print('❌ Error loading buses: $e');
-      return []; // Return empty list on error
+      return [];
     }
   }
 
-  /// Get current location of a specific bus
   Future<Map<String, dynamic>> getBusLocation(int busId) async {
     try {
       final response = await http.get(
@@ -160,7 +141,6 @@ class ApiService {
     }
   }
 
-  /// Get nearby buses based on current location
   Future<List<dynamic>> getNearbyBuses(
       double lat,
       double lng, {
@@ -183,7 +163,6 @@ class ApiService {
     }
   }
 
-  /// Get bus capacity and availability
   Future<Map<String, dynamic>> getBusCapacity(int busId) async {
     try {
       final response = await http.get(
@@ -201,9 +180,6 @@ class ApiService {
     }
   }
 
-  // ========== ETA METHODS ==========
-
-  /// Calculate ETA for a bus to reach a specific stop
   Future<Map<String, dynamic>> calculateETA(int busId, int stopId) async {
     try {
       final response = await http.get(
@@ -221,9 +197,6 @@ class ApiService {
     }
   }
 
-  // ========== BOOKING METHODS ==========
-
-  /// Create a new booking
   Future<Map<String, dynamic>> createBooking({
     required String passengerName,
     required String passengerPhone,
@@ -277,7 +250,6 @@ class ApiService {
     }
   }
 
-  /// Get user's bookings by phone number
   Future<List<dynamic>> getUserBookings(String phone) async {
     try {
       final response = await http.get(
@@ -296,10 +268,7 @@ class ApiService {
     }
   }
 
-  /// Get booking details by reference
-  Future<Map<String, dynamic>> getBookingDetails(
-      String bookingReference,
-      ) async {
+  Future<Map<String, dynamic>> getBookingDetails(String bookingReference) async {
     try {
       final response = await http.get(
         Uri.parse('$baseUrl/bookings/$bookingReference'),
@@ -317,7 +286,6 @@ class ApiService {
     }
   }
 
-  /// Cancel a booking
   Future<Map<String, dynamic>> cancelBooking(String bookingReference) async {
     try {
       final response = await http.put(
@@ -335,9 +303,137 @@ class ApiService {
     }
   }
 
-  // ========== UTILITY METHODS ==========
+  // ==========================
+  // PICKUP REQUEST METHODS
+  // ==========================
 
-  /// Test connection to backend
+  Future<Map<String, dynamic>> createPickupRequest({
+    required int routeId,
+    required double latitude,
+    required double longitude,
+    String? passengerName,
+    String? passengerPhone,
+    int? pickupStopId,
+    String? pickupLocationText,
+    String? destinationText,
+    int passengerCount = 1,
+    String? notes,
+  }) async {
+    try {
+      final url = Uri.parse('$baseUrl/pickup-requests');
+
+      final body = {
+        'route_id': routeId,
+        'passenger_name': passengerName,
+        'passenger_phone': passengerPhone,
+        'pickup_stop_id': pickupStopId,
+        'pickup_location_text': pickupLocationText,
+        'latitude': latitude,
+        'longitude': longitude,
+        'destination_text': destinationText,
+        'passenger_count': passengerCount,
+        'notes': notes,
+      };
+
+      print('📤 Creating pickup request: $body');
+
+      final response = await http.post(
+        url,
+        headers: {'Content-Type': 'application/json'},
+        body: json.encode(body),
+      ).timeout(const Duration(seconds: 15));
+
+      print('📡 Pickup request response: ${response.statusCode}');
+      print('📦 Pickup request body: ${response.body}');
+
+      final data = json.decode(response.body);
+
+      if ((response.statusCode == 200 || response.statusCode == 201) &&
+          data['success'] == true) {
+        return Map<String, dynamic>.from(data['data']);
+      }
+
+      throw Exception(data['error'] ?? 'Failed to create pickup request');
+    } catch (e) {
+      print('❌ Create pickup request error: $e');
+      rethrow;
+    }
+  }
+
+  Future<List<dynamic>> getPickupRequests({
+    int? routeId,
+    String? status,
+  }) async {
+    try {
+      final query = <String, String>{};
+
+      if (routeId != null) {
+        query['route_id'] = routeId.toString();
+      }
+      if (status != null && status.trim().isNotEmpty) {
+        query['status'] = status.trim().toUpperCase();
+      }
+
+      final uri = Uri.parse('$baseUrl/pickup-requests').replace(
+        queryParameters: query.isEmpty ? null : query,
+      );
+
+      final response = await http.get(uri).timeout(const Duration(seconds: 10));
+
+      print('📡 Get pickup requests response: ${response.statusCode}');
+      print('📦 Get pickup requests body: ${response.body}');
+
+      if (response.statusCode == 200) {
+        final data = json.decode(response.body);
+        if (data['success'] == true && data['data'] is List) {
+          return List<dynamic>.from(data['data']);
+        }
+      }
+
+      return [];
+    } catch (e) {
+      print('❌ Get pickup requests error: $e');
+      return [];
+    }
+  }
+
+  Future<Map<String, dynamic>?> getPickupRequestById(int requestId) async {
+    try {
+      final url = Uri.parse('$baseUrl/pickup-requests/$requestId');
+      final response = await http.get(url).timeout(const Duration(seconds: 10));
+
+      print('📡 Get pickup request by id response: ${response.statusCode}');
+      print('📦 Get pickup request by id body: ${response.body}');
+
+      if (response.statusCode == 200) {
+        final data = json.decode(response.body);
+        if (data['success'] == true && data['data'] != null) {
+          return Map<String, dynamic>.from(data['data']);
+        }
+      }
+
+      return null;
+    } catch (e) {
+      print('❌ Get pickup request by id error: $e');
+      return null;
+    }
+  }
+
+  Future<bool> cancelPickupRequest(int requestId) async {
+    try {
+      final url = Uri.parse('$baseUrl/pickup-requests/$requestId/cancel');
+      final response = await http.put(url).timeout(const Duration(seconds: 10));
+
+      print('📡 Cancel pickup request response: ${response.statusCode}');
+      print('📦 Cancel pickup request body: ${response.body}');
+
+      return response.statusCode == 200;
+    } catch (e) {
+      print('❌ Cancel pickup request error: $e');
+      return false;
+    }
+  }
+
   Future<bool> testConnection() async {
     try {
       final response = await http.get(
@@ -352,7 +448,6 @@ class ApiService {
     }
   }
 
-  /// Get backend health status
   Future<Map<String, dynamic>?> getHealthStatus() async {
     try {
       final response = await http.get(
