@@ -433,6 +433,23 @@ class ApiService {
       return false;
     }
   }
+  Future<bool> markPickupRequestBoarded(int requestId) async {
+    try {
+      final url = Uri.parse('$baseUrl/pickup-requests/$requestId/boarded');
+      final response = await http.put(
+        url,
+        headers: {'Content-Type': 'application/json'},
+      ).timeout(const Duration(seconds: 10));
+
+      print('📡 Mark pickup request boarded response: ${response.statusCode}');
+      print('📦 Mark pickup request boarded body: ${response.body}');
+
+      return response.statusCode == 200;
+    } catch (e) {
+      print('❌ Mark pickup request boarded error: $e');
+      return false;
+    }
+  }
 
   Future<bool> testConnection() async {
     try {

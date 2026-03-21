@@ -105,14 +105,15 @@ class _TrackingScreenState extends State<TrackingScreen> {
         _savedPassenger = passenger;
       });
 
-      if (widget.bookingId == null) {
+      if (widget.bookingId == null &&
+          _activePickupRequest == null &&
+          _activeBuses.isNotEmpty) {
         await _recoverExistingPickupRequest();
       }
     } catch (e) {
       print('❌ Error loading saved passenger: $e');
     }
   }
-
   String _normalizePhone(String value) {
     final raw = value.trim();
     if (raw.isEmpty) return '';
@@ -265,6 +266,67 @@ class _TrackingScreenState extends State<TrackingScreen> {
     return value == 'PENDING' || value == 'ACCEPTED';
   }
 
+  bool _textLooksSimilar(String? a, String? b) {
+    final x = (a ?? '').trim().toLowerCase();
+    final y = (b ?? '').trim().toLowerCase();
+
+    if (x.isEmpty || y.isEmpty) return false;
+    if (x == y) return true;
+    if (x.contains(y) || y.contains(x)) return true;
+
+    return false;
+  }
+
+  bool _isCurrentContextMatch(Map<String, dynamic> request) {
+    final requestDestination =
+    (request['destination_text'] ?? '').toString().trim().toLowerCase();
+    final currentDestination =
+    (widget.toLocation ?? '').toString().trim().toLowerCase();
+
+    final requestPickup = (
+        request['pickup_location_text'] ??
+            request['pickup_stop_name'] ??
+            ''
+    ).toString().trim().toLowerCase();
+
+    final currentPickupCandidates = <String>[
+      (widget.fromLocation ?? '').trim().toLowerCase(),
+      (_nearestStop?['stop_name'] ?? '').toString().trim().toLowerCase(),
+      (_selectedPickupStop?['stop_name'] ?? '').toString().trim().toLowerCase(),
+    ].where((e) => e.isNotEmpty).toList();
+
+    final destinationMatches = currentDestination.isNotEmpty
+        ? _textLooksSimilar(requestDestination, currentDestination)
+        : true;
+
+    final pickupMatches = currentPickupCandidates.isNotEmpty
+        ? currentPickupCandidates.any((candidate) => _textLooksSimilar(requestPickup, candidate))
+        : true;
+
+    return destinationMatches && pickupMatches;
+  }
+  bool _isRequestStillValid(Map<String, dynamic> request) {
+    final status = (request['status'] ?? '').toString().toUpperCase();
+
+    if (status == 'CANCELLED' || status == 'COMPLETED' || status == 'BOARDED') {
+      return false;
+    }
+
+    final requestedAtRaw = request['requested_at']?.toString();
+    if (requestedAtRaw == null || requestedAtRaw.isEmpty) return false;
+
+    final requestedAt = DateTime.tryParse(requestedAtRaw);
+    if (requestedAt == null) return false;
+
+    final ageMinutes = DateTime.now().difference(requestedAt.toLocal()).inMinutes;
+
+    // old requests should not come back on next app open
+    if (ageMinutes > 30) {
+      return false;
+    }
+
+    return true;
+  }
   Future<void> _recoverExistingPickupRequest() async {
     if (_savedPassenger == null) return;
     if (widget.bookingId != null) return;
@@ -278,14 +340,22 @@ class _TrackingScreenState extends State<TrackingScreen> {
           .where((r) => r is Map<String, dynamic>)
           .cast<Map<String, dynamic>>()
           .where((r) => _isSamePassengerRequest(r))
+          .where((r) => r['route_id'].toString() == widget.route['route_id'].toString())
           .where((r) => _isOpenPickupStatus(r['status']?.toString()))
+          .where((r) => _isCurrentContextMatch(r))
+          .where((r) => _isRequestStillValid(r))
           .toList();
 
-      if (matches.isEmpty) return;
+      if (matches.isEmpty) {
+        print('ℹ️ No pickup request matched current screen context');
+        return;
+      }
 
       matches.sort((a, b) {
-        final aTime = DateTime.tryParse((a['requested_at'] ?? '').toString()) ?? DateTime(2000);
-        final bTime = DateTime.tryParse((b['requested_at'] ?? '').toString()) ?? DateTime(2000);
+        final aTime =
+            DateTime.tryParse((a['requested_at'] ?? '').toString()) ?? DateTime(2000);
+        final bTime =
+            DateTime.tryParse((b['requested_at'] ?? '').toString()) ?? DateTime(2000);
         return bTime.compareTo(aTime);
       });
 
@@ -300,7 +370,6 @@ class _TrackingScreenState extends State<TrackingScreen> {
       print('❌ Error recovering pickup request: $e');
     }
   }
-
   void _startPickupRequestStatusPolling() {
     _pickupRequestStatusTimer?.cancel();
 
@@ -324,6 +393,16 @@ class _TrackingScreenState extends State<TrackingScreen> {
 
       final oldStatus = (_activePickupRequest!['status'] ?? '').toString().toUpperCase();
       final newStatus = (latest['status'] ?? '').toString().toUpperCase();
+
+      if (!_isRequestStillValid(latest)) {
+        _pickupRequestStatusTimer?.cancel();
+        if (mounted) {
+          setState(() {
+            _activePickupRequest = null;
+          });
+        }
+        return;
+      }
 
       setState(() {
         _activePickupRequest = latest;
@@ -698,16 +777,18 @@ class _TrackingScreenState extends State<TrackingScreen> {
         pickupStopId: pickupStop?['stop_id'] is int
             ? pickupStop!['stop_id'] as int
             : int.tryParse((pickupStop?['stop_id'] ?? '').toString()),
-        pickupLocationText: (_customPickupText != null && _customPickupText!.trim().isNotEmpty)
-            ? _customPickupText!.trim()
-            : pickupStop?['stop_name']?.toString() ??
+        pickupLocationText: pickupStop?['stop_name']?.toString() ??
             widget.fromLocation ??
             'Current Location',
         latitude: _userLocation!.latitude,
         longitude: _userLocation!.longitude,
         destinationText: widget.toLocation,
         passengerCount: passengerCount,
-        notes: notes.isEmpty ? null : notes,
+        notes: notes.isNotEmpty
+            ? notes
+            : (_customPickupText != null && _customPickupText!.trim().isNotEmpty
+            ? _customPickupText!.trim()
+            : null),
       );
 
       if (!mounted) return;
@@ -795,7 +876,57 @@ class _TrackingScreenState extends State<TrackingScreen> {
       print('❌ Cancel pickup request error: $e');
     }
   }
+  Future<void> _markQuickMatchBoarded() async {
+    if (_activePickupRequest == null) return;
 
+    final requestId = int.tryParse(_activePickupRequest!['request_id'].toString());
+    if (requestId == null) return;
+
+    final confirm = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Confirm boarding'),
+        content: const Text('Have you boarded the matched bus?'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context, false),
+            child: const Text('Not yet'),
+          ),
+          ElevatedButton(
+            onPressed: () => Navigator.pop(context, true),
+            child: const Text('Yes'),
+          ),
+        ],
+      ),
+    );
+
+    if (confirm != true) return;
+
+    final success = await _apiService.markPickupRequestBoarded(requestId);
+
+    if (!mounted) return;
+
+    if (success) {
+      _pickupRequestStatusTimer?.cancel();
+      setState(() {
+        _activePickupRequest = null;
+      });
+
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('✅ Pickup trip completed'),
+          backgroundColor: Colors.green,
+        ),
+      );
+    } else {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Failed to complete pickup trip'),
+          backgroundColor: Colors.red,
+        ),
+      );
+    }
+  }
   Widget _buildPickupRequestStatusCard() {
     if (_activePickupRequest == null) return const SizedBox.shrink();
 
@@ -892,7 +1023,7 @@ class _TrackingScreenState extends State<TrackingScreen> {
                       ),
                     ),
                   ),
-                if (status == 'ACCEPTED')
+                if (status == 'ACCEPTED') ...[
                   Expanded(
                     child: ElevatedButton.icon(
                       onPressed: () {
@@ -916,6 +1047,19 @@ class _TrackingScreenState extends State<TrackingScreen> {
                       ),
                     ),
                   ),
+                  const SizedBox(width: 10),
+                  Expanded(
+                    child: ElevatedButton.icon(
+                      onPressed: _markQuickMatchBoarded,
+                      icon: const Icon(Icons.check_circle),
+                      label: const Text('I Took Bus'),
+                      style: ElevatedButton.styleFrom(
+                        backgroundColor: Colors.blue[700],
+                        foregroundColor: Colors.white,
+                      ),
+                    ),
+                  ),
+                ],
                 const SizedBox(width: 10),
                 Expanded(
                   child: ElevatedButton.icon(
@@ -1493,7 +1637,18 @@ class _TrackingScreenState extends State<TrackingScreen> {
           });
 
           _prepareDirectionAwarePickupCandidates();
+          if (widget.bookingId == null && _savedPassenger != null) {
+            if (_activePickupRequest != null &&
+                !_isCurrentContextMatch(_activePickupRequest!)) {
+              setState(() {
+                _activePickupRequest = null;
+              });
+            }
 
+            if (_activePickupRequest == null) {
+              await _recoverExistingPickupRequest();
+            }
+          }
           if (_isPickupAccepted) {
             final matchedBus = _getMatchedBus();
             if (matchedBus != null) {
